@@ -14,7 +14,6 @@ from io import StringIO, BytesIO
 import csv
 import geopandas as gpd
 import requests
-import shutil
 
 # ------------------------
 # CONFIG
@@ -25,7 +24,8 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-DEM_PATH = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.img")
+# Use GeoTIFF for DEM to ensure Rasterio can read it
+DEM_PATH = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.tif")
 LULC_PATH = os.path.join(DATA_DIR, "lc2022.tif")
 GRID_SIZE = 80  # sampling resolution
 
@@ -33,6 +33,9 @@ GRID_SIZE = 80  # sampling resolution
 DEM_GDRIVE_ID = "113sRzSWz9PQUBrysiCu6Mo_wUqI6Kp3G"
 LULC_GDRIVE_ID = "YOUR_LULC_FILE_ID"
 
+# ------------------------
+# FASTAPI SETUP
+# ------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -49,23 +52,33 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # HELPER FUNCTIONS
 # ------------------------
 def download_from_gdrive(file_id, dest_path):
-    """Download a large file from Google Drive with confirmation."""
+    """Download large file from Google Drive safely."""
     url = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(url, stream=True)
     token = None
     for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
+        if key.startswith("download_warning"):
             token = value
     if token:
-        params = {'id': file_id, 'confirm': token}
+        params = {"id": file_id, "confirm": token}
         response = session.get(url, params=params, stream=True)
-    total = int(response.headers.get('Content-Length', 0))
-    with open(dest_path, 'wb') as f:
+
+    with open(dest_path, "wb") as f:
         for chunk in response.iter_content(32768):
             if chunk:
                 f.write(chunk)
+    if os.path.getsize(dest_path) < 1000:
+        raise ValueError(f"Downloaded file {dest_path} seems too small. Download may have failed.")
     print(f"Downloaded {dest_path} successfully.")
+
+def verify_raster(path):
+    """Check if Rasterio can open the file"""
+    try:
+        with rasterio.open(path) as ds:
+            print(f"Raster {path} opened successfully. Size: {ds.width}x{ds.height}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to open raster {path}: {e}")
 
 def compute_slope_from_dem(dem_array, xres=30.0, yres=30.0):
     dz_dy, dz_dx = np.gradient(dem_array.astype(float), yres, xres)
@@ -102,7 +115,6 @@ def compute_rain_heat(elev, slope, lc, rainfall, temperature):
 
 def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
     """Process AOI and generate heat_index & flood_prob grid"""
-    # Read only clipped DEM & LULC
     with rasterio.open(DEM_PATH) as dem_raster:
         dem_crop, dem_transform = mask(dem_raster, [mapping(poly)], crop=True)
     with rasterio.open(LULC_PATH) as lulc_raster:
@@ -171,10 +183,24 @@ def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
 # ------------------------
 if not os.path.exists(DEM_PATH):
     print("DEM not found, downloading from Google Drive...")
-    download_from_gdrive(DEM_GDRIVE_ID, DEM_PATH)
+    temp_img = os.path.join(DATA_DIR, "srtm_temp.img")
+    download_from_gdrive(DEM_GDRIVE_ID, temp_img)
+    # Convert to GeoTIFF
+    try:
+        import subprocess
+        tif_path = DEM_PATH
+        subprocess.run(["gdal_translate", temp_img, tif_path], check=True)
+        os.remove(temp_img)
+        print(f"Converted DEM to GeoTIFF: {tif_path}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert DEM to GeoTIFF: {e}")
+
+verify_raster(DEM_PATH)
+
 if not os.path.exists(LULC_PATH):
     print("LULC not found, downloading from Google Drive...")
     download_from_gdrive(LULC_GDRIVE_ID, LULC_PATH)
+    verify_raster(LULC_PATH)
 
 # ------------------------
 # ROUTES
@@ -186,8 +212,6 @@ async def root():
         with open(index_path,"r",encoding="utf-8") as f:
             return HTMLResponse(f.read())
     return HTMLResponse("<h1>index.html NOT FOUND</h1>")
-
-app.add_api_route("/", endpoint=root, methods=["HEAD"], include_in_schema=False)
 
 @app.post("/simulate")
 async def simulate(request: Request):
