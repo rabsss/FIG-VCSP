@@ -12,4 +12,3 @@ matplotlib
 requests
 geopandas
 gdown
-shutil
