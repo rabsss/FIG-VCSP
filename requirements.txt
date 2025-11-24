@@ -9,4 +9,5 @@ jinja2
 geopy
 rasterio
 matplotlib
+requests
 geopandas
