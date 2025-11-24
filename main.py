@@ -16,6 +16,7 @@ from io import StringIO, BytesIO
 import csv
 import geopandas as gpd
 import requests
+import gdown
 
 # ------------------------
 # CONFIG
