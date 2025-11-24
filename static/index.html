@@ -1,0 +1,254 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GeoClimate — Flood Analysis</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <style>
+    body {
+      margin:0;
+      padding:0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #f5f7fa;
+    }
+    #map { 
+      height: 80vh;
+      border-top: 2px solid #1976d2;
+    }
+    #controls {
+      display:flex;
+      flex-wrap:wrap;
+      align-items:center;
+      gap:12px;
+      padding:15px 20px;
+      background:#ffffff;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+      border-bottom: 2px solid #1976d2;
+    }
+    input[type=number] {
+      width:120px;
+      font-size:16px;
+      padding:6px 10px;
+      border-radius:5px;
+      border:1px solid #ccc;
+    }
+    .btn {
+      padding:10px 18px;
+      font-size:16px;
+      background:#1976d2;
+      color:white;
+      border:none;
+      border-radius:6px;
+      cursor:pointer;
+      transition: 0.2s;
+    }
+    .btn:hover { background:#1565c0; }
+    .btn:disabled { opacity:0.6; cursor:not-allowed; }
+    .btn-clear { background:#e53935; }
+    .btn-clear:hover { background:#c62828; }
+    .btn-csv { background:#6a1b9a; }
+    .btn-csv:hover { background:#4a0072; }
+    label { font-size:16px; font-weight:500; }
+    
+    /* File input styling */
+    #geojson_upload {
+      display: none; /* hide the default input */
+    }
+    .file-label {
+      display:inline-block;
+      padding:10px 18px;
+      font-size:16px;
+      background:#009688;
+      color:white;
+      border-radius:6px;
+      cursor:pointer;
+      transition:0.2s;
+    }
+    .file-label:hover { background:#00796b; }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <label>Rainfall (mm): <input id="rain" type="number" value="80" /></label>
+  <label>Temperature (°C): <input id="temp" type="number" value="28" /></label>
+
+  <button id="simulate" class="btn">Simulate</button>
+  <button id="export_csv" class="btn btn-csv">Export CSV</button>
+  <button id="clear" class="btn btn-clear">Clear AOI</button>
+
+  <!-- Styled file input -->
+  <label class="file-label" for="geojson_upload">Upload GeoJSON</label>
+  <input type="file" id="geojson_upload" accept=".geojson" />
+</div>
+
+<div id="map"></div>
+
+<script>
+let lastResults = null;
+let map = L.map('map').setView([27.7, 85.32], 7);
+
+// Base layer
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '&copy; OSM contributors'
+}).addTo(map);
+
+// Draw controls
+const drawnItems = new L.FeatureGroup().addTo(map);
+const drawControl = new L.Control.Draw({
+  edit: { featureGroup: drawnItems },
+  draw: { 
+    polyline:false, rectangle:false, circle:false, 
+    marker:false, circlemarker:false,
+    polygon:{allowIntersection:false} 
+  }
+});
+map.addControl(drawControl);
+
+map.on(L.Draw.Event.CREATED, function(e){
+  drawnItems.clearLayers();
+  drawnItems.addLayer(e.layer);
+});
+
+// ------------------------
+// COUNTRY BOUNDARY
+// ------------------------
+fetch('data/country.geojson')
+  .then(res => res.json())
+  .then(data => {
+    L.geoJSON(data, {style:{color:'#2e7d32', weight:2, fillOpacity:0}}).addTo(map);
+  });
+
+// Clear AOI
+document.getElementById('clear').onclick = function(){
+  drawnItems.clearLayers();
+  if(window.aoiLayer) map.removeLayer(window.aoiLayer);
+  lastResults = null;
+};
+
+// ---------------------
+// SIMULATION
+// ---------------------
+async function runSimulation(aoi){
+  const rainfall = parseFloat(document.getElementById('rain').value);
+  const temperature = parseFloat(document.getElementById('temp').value);
+
+  const res = await fetch("/simulate",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({aoi,rainfall,temperature})
+  });
+  return res.json();
+}
+
+document.getElementById('simulate').onclick = async function(){
+  let poly = null;
+  if(drawnItems.getLayers().length>0){
+    poly = drawnItems.getLayers()[0].toGeoJSON().geometry;
+  } else {
+    alert("Draw a polygon or upload a GeoJSON first!");
+    return;
+  }
+
+  this.disabled=true; 
+  this.textContent="Running...";
+
+  try{
+    const data = await runSimulation(poly);
+    lastResults = data;
+
+    const aoi = data.aoi;
+    const summary = data.summary;
+
+    if(window.aoiLayer) map.removeLayer(window.aoiLayer);
+
+    window.aoiLayer = L.geoJSON(aoi, {
+      style: { color:'#ff5722', weight:2, fillOpacity:0.1 }
+    }).addTo(map);
+
+    window.aoiLayer.bindTooltip(`
+      <b>AOI Summary</b><br>
+      Flood Probability: ${(summary.mean_flood_prob*100).toFixed(1)}%<br>
+      Heat Index: ${summary.mean_heat_index.toFixed(2)} °C
+    `, {sticky:true});
+
+    map.fitBounds(window.aoiLayer.getBounds());
+
+  } catch(err){
+    alert("Error: "+err);
+  } finally {
+    this.disabled=false; 
+    this.textContent="Simulate";
+  }
+};
+
+// ------------------------
+// EXPORT CSV
+// ------------------------
+document.getElementById('export_csv').onclick = async function(){
+  if(!lastResults){ alert("Run simulation first!"); return; }
+
+  const response = await fetch("/export_csv",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(lastResults)
+  });
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); 
+  a.href=url;
+  a.download="flood_simulation.csv"; 
+  a.click();
+};
+
+// ------------------------
+// UPLOAD GEOJSON
+// ------------------------
+document.getElementById('geojson_upload').onchange = async function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try{
+    const res = await fetch("/upload_geojson",{
+      method:"POST",
+      body:formData
+    });
+
+    const data = await res.json();
+    lastResults = data;    
+
+    const aoi = data.aoi;
+    const summary = data.summary;
+
+    if(window.aoiLayer) map.removeLayer(window.aoiLayer);
+
+    window.aoiLayer = L.geoJSON(aoi,{
+      style: { color:'#ff5722', weight:2, fillOpacity:0.1 }
+    }).addTo(map);
+
+    window.aoiLayer.bindTooltip(`
+      <b>AOI Summary</b><br>
+      Flood Probability: ${(summary.mean_flood_prob*100).toFixed(1)}%<br>
+      Heat Index: ${summary.mean_heat_index.toFixed(2)} °C
+    `, {sticky:true});
+
+    map.fitBounds(window.aoiLayer.getBounds());
+
+  }catch(err){
+    alert("Upload failed: "+err);
+  }
+};
+</script>
+
+</body>
+</html>

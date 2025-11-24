@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Python egg
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Data (optional: if you don't want to commit large datasets)
+data/srtm_cgiar_nepal_boundary.img
+data/lc2022.tif
+data/*.tif
+data/*.img
+
+# Jupyter Notebooks checkpoints
+.ipynb_checkpoints/
+
+# Outputs
+*.csv
+*.geojson
+*.png
+*.pdf
+
+# Misc
+*.bak
+*.swp
