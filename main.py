@@ -187,6 +187,8 @@ async def root():
             return HTMLResponse(f.read())
     return HTMLResponse("<h1>index.html NOT FOUND</h1>")
 
+app.add_api_route("/", endpoint=root, methods=["HEAD"], include_in_schema=False)
+
 @app.post("/simulate")
 async def simulate(request: Request):
     payload = await request.json()
