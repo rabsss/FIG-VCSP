@@ -51,8 +51,9 @@ def download_from_gdrive(file_id, dest_path):
 # DEM
 if not os.path.exists(DEM_PATH):
     print("DEM not found, downloading from Google Drive...")
-    file_id = "113sRzSWz9PQUBrysiCu6Mo_wUqI6Kp3G"  # Your link
-    download_from_gdrive(file_id, DEM_PATH)
+    url = "https://drive.google.com/uc?id=113sRzSWz9PQUBrysiCu6Mo_wUqI6Kp3G"
+    os.makedirs(os.path.dirname(DEM_PATH), exist_ok=True)
+    gdown.download(url, DEM_PATH, quiet=False)
     print("DEM downloaded successfully.")
 
 # LULC
