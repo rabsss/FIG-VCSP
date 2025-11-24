@@ -33,7 +33,7 @@ GRID_SIZE = 80  # Sampling resolution
 # GOOGLE DRIVE DEM DOWNLOAD
 # ------------------------
 def download_from_gdrive(file_id, dest_path):
-    URL = "https://docs.google.com/uc?export=download"
+    URL = "https://drive.google.com/file/d/113sRzSWz9PQUBrysiCu6Mo_wUqI6Kp3G/view?usp=drive_link"
     session = requests.Session()
     response = session.get(URL, params={'id': file_id}, stream=True)
     token = None
