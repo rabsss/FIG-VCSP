@@ -14,6 +14,11 @@ from io import StringIO, BytesIO
 import csv
 import geopandas as gpd
 import requests
+import subprocess
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("main")
 
 # ------------------------
 # CONFIG
@@ -24,8 +29,9 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-# Use GeoTIFF for DEM to ensure Rasterio can read it
-DEM_PATH = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.tif")
+# final DEM will be GeoTIFF; we keep temp IMG while downloading/converting
+DEM_TIF = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.tif")
+DEM_IMG_TEMP = os.path.join(DATA_DIR, "srtm_temp.img")
 LULC_PATH = os.path.join(DATA_DIR, "lc2022.tif")
 GRID_SIZE = 80  # sampling resolution
 
@@ -52,31 +58,59 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # HELPER FUNCTIONS
 # ------------------------
 def download_from_gdrive(file_id, dest_path):
-    """Download large file from Google Drive safely."""
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    """
+    Download a (possibly large) file from Google Drive handling confirmation token.
+    Raises RuntimeError if it looks like Drive returned HTML instead of the file.
+    """
+    url = "https://drive.google.com/uc?export=download"
     session = requests.Session()
-    response = session.get(url, stream=True)
+    logger.info("Requesting initial download session...")
+    response = session.get(url, params={"id": file_id}, stream=True, timeout=60)
+
+    # Look for the confirm token in cookies or in the page
     token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             token = value
-    if token:
-        params = {"id": file_id, "confirm": token}
-        response = session.get(url, params=params, stream=True)
+            break
 
+    if token:
+        logger.info("Found confirmation token in cookies; requesting with confirm token...")
+        response = session.get(url, params={"id": file_id, "confirm": token}, stream=True, timeout=60)
+
+    # Write to file in binary mode
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(32768):
             if chunk:
                 f.write(chunk)
-    if os.path.getsize(dest_path) < 1000:
-        raise ValueError(f"Downloaded file {dest_path} seems too small. Download may have failed.")
-    print(f"Downloaded {dest_path} successfully.")
+
+    size_bytes = os.path.getsize(dest_path)
+    size_mb = size_bytes / (1024*1024)
+    logger.info(f"Downloaded file to {dest_path} ({size_mb:.2f} MB)")
+
+    # Basic sanity checks
+    if size_bytes < 5 * 1024:  # less than ~5 KB => almost certainly an HTML page or error
+        # peek into file to see if it is HTML
+        with open(dest_path, "rb") as fh:
+            head = fh.read(512).lower()
+            if b"<html" in head or b"doctype html" in head:
+                raise RuntimeError("Downloaded file looks like HTML (Google Drive returned a confirmation page). Check share permissions.")
+        raise RuntimeError("Downloaded file is suspiciously small. Download may have failed.")
+
+def convert_img_to_tif(img_path, tif_path):
+    """
+    Convert raster using gdal_translate. Raises subprocess.CalledProcessError on failure.
+    """
+    logger.info(f"Converting {img_path} -> {tif_path} using gdal_translate...")
+    cmd = ["gdal_translate", "-of", "GTiff", img_path, tif_path]
+    subprocess.run(cmd, check=True)
+    logger.info("Conversion completed.")
 
 def verify_raster(path):
-    """Check if Rasterio can open the file"""
+    """Try opening raster with rasterio to ensure it's valid."""
     try:
         with rasterio.open(path) as ds:
-            print(f"Raster {path} opened successfully. Size: {ds.width}x{ds.height}")
+            logger.info(f"Raster {path} opened successfully (size {ds.width}x{ds.height})")
     except Exception as e:
         raise RuntimeError(f"Failed to open raster {path}: {e}")
 
@@ -115,14 +149,23 @@ def compute_rain_heat(elev, slope, lc, rainfall, temperature):
 
 def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
     """Process AOI and generate heat_index & flood_prob grid"""
-    with rasterio.open(DEM_PATH) as dem_raster:
+    # Read only clipped DEM & LULC
+    with rasterio.open(DEM_TIF) as dem_raster:
         dem_crop, dem_transform = mask(dem_raster, [mapping(poly)], crop=True)
     with rasterio.open(LULC_PATH) as lulc_raster:
         lulc_crop, _ = mask(lulc_raster, [mapping(poly)], crop=True)
     if dem_crop.size==0:
         raise ValueError("AOI does not intersect DEM/LULC")
     
-    dem_arr = dem_crop[0]
+    dem_arr = dem_crop[0].astype(float)
+    # Replace rasterio nodata values with nan
+    try:
+        nod = dem_raster.nodata
+        if nod is not None:
+            dem_arr[dem_arr==nod] = np.nan
+    except:
+        pass
+
     lulc_arr = lulc_crop[0]
     slope_crop = compute_slope_from_dem(dem_arr)
     rows, cols = dem_arr.shape
@@ -179,28 +222,69 @@ def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
     return fc, aoi_feature, summary
 
 # ------------------------
-# DOWNLOAD FILES IF MISSING
+# DOWNLOAD & PREP DEM/LULC (GDAL path)
 # ------------------------
-if not os.path.exists(DEM_PATH):
-    print("DEM not found, downloading from Google Drive...")
-    temp_img = os.path.join(DATA_DIR, "srtm_temp.img")
-    download_from_gdrive(DEM_GDRIVE_ID, temp_img)
-    # Convert to GeoTIFF
+def prepare_dem_and_lulc():
+    # DEM: if tif exists, verify and use it
+    if os.path.exists(DEM_TIF):
+        try:
+            verify_raster(DEM_TIF)
+            logger.info("Using existing DEM TIFF.")
+            return
+        except Exception as e:
+            logger.warning(f"Existing DEM TIFF invalid: {e}. Will re-download.")
+
+    # If temp IMG exists and is valid, try converting
+    if os.path.exists(DEM_IMG_TEMP):
+        try:
+            # quick check for HTML text at top
+            with open(DEM_IMG_TEMP, "rb") as fh:
+                head = fh.read(512).lower()
+                if b"<html" in head or b"doctype html" in head:
+                    raise RuntimeError("Downloaded DEM IMG looks like HTML, re-downloading.")
+            # try conversion
+            convert_img_to_tif(DEM_IMG_TEMP, DEM_TIF)
+            verify_raster(DEM_TIF)
+            os.remove(DEM_IMG_TEMP)
+            return
+        except Exception as e:
+            logger.warning(f"Temp IMG invalid or conversion failed: {e}. Will re-download.")
+
+    # download fresh
+    logger.info("Downloading DEM IMG from Google Drive...")
+    download_from_gdrive(DEM_GDRIVE_ID, DEM_IMG_TEMP)
+
+    # ensure not HTML
+    with open(DEM_IMG_TEMP, "rb") as fh:
+        head = fh.read(512).lower()
+        if b"<html" in head or b"doctype html" in head:
+            raise RuntimeError("Drive returned HTML page instead of raster. Check file sharing settings.")
+
+    # convert to tif using gdal_translate
+    convert_img_to_tif(DEM_IMG_TEMP, DEM_TIF)
+    verify_raster(DEM_TIF)
+    # remove temp IMG to save space
     try:
-        import subprocess
-        tif_path = DEM_PATH
-        subprocess.run(["gdal_translate", temp_img, tif_path], check=True)
-        os.remove(temp_img)
-        print(f"Converted DEM to GeoTIFF: {tif_path}")
-    except Exception as e:
-        raise RuntimeError(f"Failed to convert DEM to GeoTIFF: {e}")
+        os.remove(DEM_IMG_TEMP)
+    except:
+        pass
 
-verify_raster(DEM_PATH)
+    # LULC: download if not present (we expect a tif)
+    if not os.path.exists(LULC_PATH):
+        if LULC_GDRIVE_ID and LULC_GDRIVE_ID != "YOUR_LULC_FILE_ID":
+            logger.info("Downloading LULC from Google Drive...")
+            download_from_gdrive(LULC_GDRIVE_ID, LULC_PATH)
+            verify_raster(LULC_PATH)
+        else:
+            logger.warning("LULC not provided; LULC path missing. Some API functions may fail.")
 
-if not os.path.exists(LULC_PATH):
-    print("LULC not found, downloading from Google Drive...")
-    download_from_gdrive(LULC_GDRIVE_ID, LULC_PATH)
-    verify_raster(LULC_PATH)
+# Run preparation at import/startup
+try:
+    prepare_dem_and_lulc()
+except Exception as e:
+    logger.error(f"Failed to prepare DEM/LULC: {e}")
+    # Re-raise so the container logs the error and startup fails clearly
+    raise
 
 # ------------------------
 # ROUTES
@@ -212,6 +296,8 @@ async def root():
         with open(index_path,"r",encoding="utf-8") as f:
             return HTMLResponse(f.read())
     return HTMLResponse("<h1>index.html NOT FOUND</h1>")
+
+app.add_api_route("/", endpoint=root, methods=["HEAD"], include_in_schema=False)
 
 @app.post("/simulate")
 async def simulate(request: Request):
@@ -294,7 +380,7 @@ async def upload_geojson(file: UploadFile = File(...)):
     })
 
 # ------------------------
-# RUN
+# RUN (for local dev)
 # ------------------------
 if __name__=="__main__":
     import uvicorn
