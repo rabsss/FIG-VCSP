@@ -15,10 +15,6 @@ import csv
 import geopandas as gpd
 import requests
 import subprocess
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("main")
 
 # ------------------------
 # CONFIG
@@ -29,15 +25,13 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
-# final DEM will be GeoTIFF; we keep temp IMG while downloading/converting
-DEM_TIF = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.tif")
 DEM_IMG_TEMP = os.path.join(DATA_DIR, "srtm_temp.img")
+DEM_PATH = os.path.join(DATA_DIR, "srtm_cgiar_nepal_boundary.tif")
 LULC_PATH = os.path.join(DATA_DIR, "lc2022.tif")
-GRID_SIZE = 80  # sampling resolution
+GRID_SIZE = 80
 
-# Google Drive file IDs (replace with your actual file IDs)
-DEM_GDRIVE_ID = "113sRzSWz9PQUBrysiCu6Mo_wUqI6Kp3G"
-LULC_GDRIVE_ID = "YOUR_LULC_FILE_ID"
+# MediaFire DEM link (replace with yours)
+DEM_MEDIAFIRE_URL = "https://www.mediafire.com/file/5amrotgjt6twxzn/srtm_cgiar_nepal_boundary.img/file"
 
 # ------------------------
 # FASTAPI SETUP
@@ -57,60 +51,32 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ------------------------
 # HELPER FUNCTIONS
 # ------------------------
-def download_from_gdrive(file_id, dest_path):
-    """
-    Download a (possibly large) file from Google Drive handling confirmation token.
-    Raises RuntimeError if it looks like Drive returned HTML instead of the file.
-    """
-    url = "https://drive.google.com/uc?export=download"
+def download_from_mediafire(url, dest_path):
+    """Download file from MediaFire by following redirects."""
     session = requests.Session()
-    logger.info("Requesting initial download session...")
-    response = session.get(url, params={"id": file_id}, stream=True, timeout=60)
-
-    # Look for the confirm token in cookies or in the page
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-
-    if token:
-        logger.info("Found confirmation token in cookies; requesting with confirm token...")
-        response = session.get(url, params={"id": file_id, "confirm": token}, stream=True, timeout=60)
-
-    # Write to file in binary mode
+    resp = session.get(url, stream=True, allow_redirects=True, timeout=60)
     with open(dest_path, "wb") as f:
-        for chunk in response.iter_content(32768):
+        for chunk in resp.iter_content(32768):
             if chunk:
                 f.write(chunk)
-
-    size_bytes = os.path.getsize(dest_path)
-    size_mb = size_bytes / (1024*1024)
-    logger.info(f"Downloaded file to {dest_path} ({size_mb:.2f} MB)")
-
-    # Basic sanity checks
-    if size_bytes < 5 * 1024:  # less than ~5 KB => almost certainly an HTML page or error
-        # peek into file to see if it is HTML
-        with open(dest_path, "rb") as fh:
-            head = fh.read(512).lower()
-            if b"<html" in head or b"doctype html" in head:
-                raise RuntimeError("Downloaded file looks like HTML (Google Drive returned a confirmation page). Check share permissions.")
-        raise RuntimeError("Downloaded file is suspiciously small. Download may have failed.")
+    size_mb = os.path.getsize(dest_path)/(1024*1024)
+    if size_mb < 1:  # DEM should be larger than 1 MB
+        raise RuntimeError("Downloaded file too small, likely HTML or invalid download.")
+    print(f"Downloaded file from MediaFire: {dest_path} (~{size_mb:.2f} MB)")
 
 def convert_img_to_tif(img_path, tif_path):
-    """
-    Convert raster using gdal_translate. Raises subprocess.CalledProcessError on failure.
-    """
-    logger.info(f"Converting {img_path} -> {tif_path} using gdal_translate...")
-    cmd = ["gdal_translate", "-of", "GTiff", img_path, tif_path]
-    subprocess.run(cmd, check=True)
-    logger.info("Conversion completed.")
+    """Convert .img raster to GeoTIFF using GDAL."""
+    try:
+        subprocess.run(["gdal_translate", "-of", "GTiff", img_path, tif_path], check=True)
+        print(f"Converted {img_path} to GeoTIFF: {tif_path}")
+    except Exception as e:
+        raise RuntimeError(f"GDAL conversion failed: {e}")
 
 def verify_raster(path):
-    """Try opening raster with rasterio to ensure it's valid."""
+    """Check if Rasterio can open the file"""
     try:
         with rasterio.open(path) as ds:
-            logger.info(f"Raster {path} opened successfully (size {ds.width}x{ds.height})")
+            print(f"Raster {path} opened successfully. Size: {ds.width}x{ds.height}")
     except Exception as e:
         raise RuntimeError(f"Failed to open raster {path}: {e}")
 
@@ -149,23 +115,14 @@ def compute_rain_heat(elev, slope, lc, rainfall, temperature):
 
 def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
     """Process AOI and generate heat_index & flood_prob grid"""
-    # Read only clipped DEM & LULC
-    with rasterio.open(DEM_TIF) as dem_raster:
+    with rasterio.open(DEM_PATH) as dem_raster:
         dem_crop, dem_transform = mask(dem_raster, [mapping(poly)], crop=True)
     with rasterio.open(LULC_PATH) as lulc_raster:
         lulc_crop, _ = mask(lulc_raster, [mapping(poly)], crop=True)
     if dem_crop.size==0:
         raise ValueError("AOI does not intersect DEM/LULC")
     
-    dem_arr = dem_crop[0].astype(float)
-    # Replace rasterio nodata values with nan
-    try:
-        nod = dem_raster.nodata
-        if nod is not None:
-            dem_arr[dem_arr==nod] = np.nan
-    except:
-        pass
-
+    dem_arr = dem_crop[0]
     lulc_arr = lulc_crop[0]
     slope_crop = compute_slope_from_dem(dem_arr)
     rows, cols = dem_arr.shape
@@ -222,69 +179,14 @@ def process_aoi(poly, rainfall=80.0, temperature=28.0, grid_size=GRID_SIZE):
     return fc, aoi_feature, summary
 
 # ------------------------
-# DOWNLOAD & PREP DEM/LULC (GDAL path)
+# PREPARE DEM
 # ------------------------
-def prepare_dem_and_lulc():
-    # DEM: if tif exists, verify and use it
-    if os.path.exists(DEM_TIF):
-        try:
-            verify_raster(DEM_TIF)
-            logger.info("Using existing DEM TIFF.")
-            return
-        except Exception as e:
-            logger.warning(f"Existing DEM TIFF invalid: {e}. Will re-download.")
-
-    # If temp IMG exists and is valid, try converting
-    if os.path.exists(DEM_IMG_TEMP):
-        try:
-            # quick check for HTML text at top
-            with open(DEM_IMG_TEMP, "rb") as fh:
-                head = fh.read(512).lower()
-                if b"<html" in head or b"doctype html" in head:
-                    raise RuntimeError("Downloaded DEM IMG looks like HTML, re-downloading.")
-            # try conversion
-            convert_img_to_tif(DEM_IMG_TEMP, DEM_TIF)
-            verify_raster(DEM_TIF)
-            os.remove(DEM_IMG_TEMP)
-            return
-        except Exception as e:
-            logger.warning(f"Temp IMG invalid or conversion failed: {e}. Will re-download.")
-
-    # download fresh
-    logger.info("Downloading DEM IMG from Google Drive...")
-    download_from_gdrive(DEM_GDRIVE_ID, DEM_IMG_TEMP)
-
-    # ensure not HTML
-    with open(DEM_IMG_TEMP, "rb") as fh:
-        head = fh.read(512).lower()
-        if b"<html" in head or b"doctype html" in head:
-            raise RuntimeError("Drive returned HTML page instead of raster. Check file sharing settings.")
-
-    # convert to tif using gdal_translate
-    convert_img_to_tif(DEM_IMG_TEMP, DEM_TIF)
-    verify_raster(DEM_TIF)
-    # remove temp IMG to save space
-    try:
-        os.remove(DEM_IMG_TEMP)
-    except:
-        pass
-
-    # LULC: download if not present (we expect a tif)
-    if not os.path.exists(LULC_PATH):
-        if LULC_GDRIVE_ID and LULC_GDRIVE_ID != "YOUR_LULC_FILE_ID":
-            logger.info("Downloading LULC from Google Drive...")
-            download_from_gdrive(LULC_GDRIVE_ID, LULC_PATH)
-            verify_raster(LULC_PATH)
-        else:
-            logger.warning("LULC not provided; LULC path missing. Some API functions may fail.")
-
-# Run preparation at import/startup
-try:
-    prepare_dem_and_lulc()
-except Exception as e:
-    logger.error(f"Failed to prepare DEM/LULC: {e}")
-    # Re-raise so the container logs the error and startup fails clearly
-    raise
+if not os.path.exists(DEM_PATH):
+    print("DEM not found. Downloading from MediaFire...")
+    download_from_mediafire(DEM_MEDIAFIRE_URL, DEM_IMG_TEMP)
+    convert_img_to_tif(DEM_IMG_TEMP, DEM_PATH)
+    os.remove(DEM_IMG_TEMP)
+verify_raster(DEM_PATH)
 
 # ------------------------
 # ROUTES
@@ -296,8 +198,6 @@ async def root():
         with open(index_path,"r",encoding="utf-8") as f:
             return HTMLResponse(f.read())
     return HTMLResponse("<h1>index.html NOT FOUND</h1>")
-
-app.add_api_route("/", endpoint=root, methods=["HEAD"], include_in_schema=False)
 
 @app.post("/simulate")
 async def simulate(request: Request):
@@ -313,74 +213,8 @@ async def simulate(request: Request):
     fc,aoi_feature,summary = process_aoi(poly,rainfall=rainfall,temperature=temperature)
     return JSONResponse({"feature_collection":fc,"aoi":aoi_feature,"summary":summary})
 
-@app.post("/export_csv")
-async def export_csv(request: Request):
-    payload = await request.json()
-    if "aoi" not in payload:
-        raise HTTPException(400,"Missing 'aoi'")
-    try:
-        poly = shape(payload["aoi"]) if not ("type" in payload["aoi"] and payload["aoi"]["type"]=="Feature") else shape(payload["aoi"]["geometry"])
-    except Exception as e:
-        raise HTTPException(400,f"Invalid AOI GeoJSON: {e}")
-    rainfall = float(payload.get("rainfall",80.0))
-    temperature = float(payload.get("temperature",28.0))
-    fc,aoi_feature,summary = process_aoi(poly,rainfall=rainfall,temperature=temperature)
-    
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["latitude","longitude","heat_index","flood_prob"])
-    for feat in fc.get("features", []):
-        lon, lat = feat["geometry"]["coordinates"]
-        props = feat["properties"]
-        writer.writerow([lat, lon, props["heat_index"], props["flood_prob"]])
-    
-    csv_bytes = output.getvalue().encode("utf-8")
-    fname = f"export_{uuid.uuid4().hex}.csv"
-    return StreamingResponse(BytesIO(csv_bytes),
-                             media_type="text/csv",
-                             headers={"Content-Disposition":f"attachment; filename={fname}"})
-
-@app.post("/upload_geojson")
-async def upload_geojson(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".geojson", ".json")):
-        raise HTTPException(400,"Please upload a geojson file")
-    data = json.loads((await file.read()).decode("utf-8"))
-    gdf = gpd.GeoDataFrame.from_features(data["features"])
-    if gdf.crs is None:
-        gdf.set_crs(epsg=4326,inplace=True)
-    elif gdf.crs.to_epsg()!=4326:
-        gdf = gdf.to_crs(4326)
-    geom = gdf.unary_union
-    minx, miny, maxx, maxy = geom.bounds
-    features=[]
-    num_points=500
-    for _ in range(num_points):
-        lat = np.random.uniform(miny,maxy)
-        lon = np.random.uniform(minx,maxx)
-        pt = Point(lon,lat)
-        if not geom.contains(pt):
-            continue
-        features.append({
-            "type":"Feature",
-            "geometry":{"type":"Point","coordinates":[lon,lat]},
-            "properties":{
-                "heat_index":float(np.random.uniform(20,45)),
-                "flood_prob":float(np.random.random())
-            }
-        })
-    summary={
-        "points_sampled":len(features),
-        "mean_heat_index":float(np.mean([f["properties"]["heat_index"] for f in features])) if features else 0,
-        "mean_flood_prob":float(np.mean([f["properties"]["flood_prob"] for f in features])) if features else 0
-    }
-    return JSONResponse({
-        "aoi": data,
-        "features":{"type":"FeatureCollection","features":features},
-        "summary":summary
-    })
-
 # ------------------------
-# RUN (for local dev)
+# RUN
 # ------------------------
 if __name__=="__main__":
     import uvicorn
